@@ -50,7 +50,7 @@ func main() {
 	r, err := svc.Acquire(ctx, "demo-acq-1", "orders/1", "client-A", 2*time.Second)
 	must(err)
 	logger.Printf("  => 持有者=%s 栅栏令牌=%d 到期=%s 任期=%d",
-		r.Owner, r.Token, r.LeaseUntil.Format("15:04:05.000"), r.Term)
+		r.Owner, r.Token, r.LeaseUntil.Local().Format("15:04:05.000"), r.Term)
 
 	vr, err := svc.ValidateAndSubmit(ctx, "demo-val-1", "orders/1", "client-A", r.Token)
 	must(err)
@@ -139,7 +139,7 @@ func main() {
 	renewed, err := svc.Renew(ctx, "demo-renew-1", "orders/1", "client-A", r.Token, 3*time.Second)
 	must(err)
 	logger.Printf("【续约】重启前为 client-A 续约 orders/1 令牌=%d 新到期=%s",
-		renewed.Token, renewed.LeaseUntil.Format("15:04:05.000"))
+		renewed.Token, renewed.LeaseUntil.Local().Format("15:04:05.000"))
 
 	// 6) 重启领导者：任期与锁状态不回退
 	fmt.Println()
@@ -171,8 +171,32 @@ func main() {
 	must(err)
 	logger.Printf("  client-D 接管 orders/1，新令牌=%d（严格高于旧令牌 %d）", r4.Token, r.Token)
 
+	// 8) 归属历史 + 历史时点重建
 	fmt.Println()
-	logger.Printf("=== 全部演示结论符合预期：单主、多数派、任期单调、令牌单调、幂等、过期拒绝 ===")
+	hist, err := svc.HistoryOf(ctx, "orders/1")
+	must(err)
+	logger.Printf("【归属历史】orders/1 共 %d 段归属（只增不改、跨节点一致）：", len(hist.Segments))
+	for _, seg := range hist.Segments {
+		if seg.Closed {
+			logger.Printf("  段%d 持有者=%s 令牌=%d 续约=%d次 结束=%s (日志下标 %d)",
+				seg.Seq, seg.Owner, seg.Token, seg.Renewals, seg.EndReason, seg.EndIndex)
+		} else {
+			logger.Printf("  段%d 持有者=%s 令牌=%d 续约=%d次 当前持有中 (始于日志下标 %d)",
+				seg.Seq, seg.Owner, seg.Token, seg.Renewals, seg.StartIndex)
+		}
+	}
+	// 在"client-A 仍持有"的历史位置重建状态，并重放当时的栅栏判定。
+	past := coordinate.HistoryPosition{Index: hist.Segments[0].StartIndex}
+	stAt, err := svc.StateAt(ctx, "orders/1", past)
+	must(err)
+	logger.Printf("【历史时点】日志下标 %d 时刻：持有者=%s 令牌=%d 到期=%s",
+		stAt.Position, stAt.Owner, stAt.Token, stAt.LeaseUntil.Local().Format("15:04:05.000"))
+	vAt, vErr := svc.ValidateAt(ctx, "orders/1", "client-A", r.Token, past)
+	logger.Printf("  把 client-A 令牌 %d 的提交放回该时刻 => accepted=%v reason=%s (%v)",
+		r.Token, vAt.Accepted, vAt.Reason, vErr)
+
+	fmt.Println()
+	logger.Printf("=== 全部演示结论符合预期：单主、多数派、任期单调、令牌单调、幂等、过期拒绝、历史可追溯 ===")
 }
 
 func must(err error) {

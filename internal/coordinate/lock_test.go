@@ -230,7 +230,9 @@ func TestLock_RestartLeaderKeepsTermAndLockState(t *testing.T) {
 	svc := NewLockService(c, 300*time.Millisecond)
 	ctx := context.Background()
 
-	r, err := svc.Acquire(ctx, "k1", "durable/1", "persistent-owner", 300*time.Millisecond)
+	// 租约时长给足 5s：重启 + 重新选主的窗口内租约仍然有效，
+	// 本用例验证的是"状态持久、任期/令牌不回退"，而不是租约到期。
+	r, err := svc.Acquire(ctx, "k1", "durable/1", "persistent-owner", 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}

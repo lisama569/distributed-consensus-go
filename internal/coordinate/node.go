@@ -41,6 +41,7 @@ type event struct {
 
 	sub  *submitReq
 	read *readReq
+	hist *histReq
 }
 
 type submitReq struct {
@@ -62,6 +63,18 @@ type readOutcome struct {
 	state LockState
 	found bool
 	err   error
+}
+
+// histReq 是一条归属历史查询：在事件循环内对 FSM 的只增历史执行，
+// 与所有写操作串行，因此无需加锁且绝不读到中间态。
+type histReq struct {
+	fn func(h *History) (any, error)
+	rc chan histOutcome
+}
+
+type histOutcome struct {
+	val any
+	err error
 }
 
 // NodeStatus 是节点当前的协调角色快照。
@@ -96,9 +109,10 @@ type Node struct {
 	fsm FSM
 
 	// 原子快照：仅供事件循环写、其他 goroutine 读，避免数据竞争。
-	atomicTerm   atomic.Int64
-	atomicRole   atomic.Int32
-	atomicLeader atomic.Int32
+	atomicTerm    atomic.Int64
+	atomicRole    atomic.Int32
+	atomicLeader  atomic.Int32
+	atomicApplied atomic.Int64
 
 	eventCh chan event
 	stopCh  chan struct{}
@@ -165,15 +179,18 @@ func (n *Node) Start(ctx context.Context) error {
 	n.votedFor = st.VotedFor
 
 	// 重放已有日志重建 FSM，使重启节点立刻具备正确的锁/令牌状态。
+	// 重放使用日志条目里领导者盖的时间戳（Op.Time），
+	// 因此重建出的锁状态与归属历史和重启前逐字节一致。
 	n.fsm = NewFSM()
 	for _, e := range n.logs.EntriesFrom(1) {
 		now := n.cfg.Clock.Now()
-		if _, perr := n.fsm.Apply(e.Op, now); perr != nil {
+		if _, perr := n.fsm.Apply(e.Op, e.Index, now); perr != nil {
 			n.cfg.Logger.Printf("[node %d] replay entry %d term %d: %v", n.cfg.ID, e.Index, e.Term, perr)
 		}
 		n.lastApplied = e.Index
 	}
 	n.commitIndex = n.lastApplied
+	n.atomicApplied.Store(n.lastApplied)
 	n.publishSnapshot()
 	lastIndex := n.logs.LastIndex()
 
@@ -347,6 +364,8 @@ func (n *Node) handleEvent(e event, resetElection func()) {
 		n.handleSubmit(e.sub)
 	case e.read != nil:
 		n.handleRead(e.read)
+	case e.hist != nil:
+		n.handleHist(e.hist)
 	}
 }
 
@@ -451,7 +470,7 @@ func (n *Node) becomeLeader() {
 
 	// 上任先提交一条 no-op：在它被多数派确认前，本任期不对外提供读，
 	// 从而不会把旧领导者可能尚未提交的状态当成新结论。
-	noop := LogEntry{Index: last + 1, Term: n.term, Op: Op{Kind: OpNoop, Term: n.term}}
+	noop := LogEntry{Index: last + 1, Term: n.term, Op: Op{Kind: OpNoop, Term: n.term, Time: n.cfg.Clock.Now()}}
 	n.logs.Append([]LogEntry{noop})
 	n.registerWaiter(noop.Index, nil)
 	n.broadcastAppend()
@@ -616,9 +635,10 @@ func (n *Node) applyCommitted() {
 		if !ok {
 			continue
 		}
-		val, err := n.fsm.Apply(e.Op, n.cfg.Clock.Now())
+		val, err := n.fsm.Apply(e.Op, e.Index, n.cfg.Clock.Now())
 		n.notifyWaiters(e.Index, val, err)
 	}
+	n.atomicApplied.Store(n.lastApplied)
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +708,9 @@ func (n *Node) handleSubmit(req *submitReq) {
 	}
 	op := req.op
 	op.Term = n.term
+	// 提议时盖上本节点时间戳：它随日志复制与持久化，
+	// 是状态机租约判定与归属历史的唯一时间依据（确定性结论的关键）。
+	op.Time = n.cfg.Clock.Now()
 	idx := n.logs.LastIndex() + 1
 	// 必须先登记 waiter 再追加/广播：否则快速返回的复制响应可能在
 	// 登记之前就推进提交并 notifyWaiters，导致本次提交永久等待。
@@ -703,6 +726,79 @@ func (n *Node) handleRead(req *readReq) {
 	}
 	st, found := n.fsm.Lookup(req.resource)
 	req.rc <- readOutcome{state: st, found: found}
+}
+
+// handleHist 在事件循环内执行历史查询。历史由已提交日志派生、只增不改，
+// 因此任何角色（含跟随者）都能就"已应用的位置"给出完全一致的答案；
+// 超出本节点已应用范围的位置返回 ErrHistoryBeyond。
+func (n *Node) handleHist(req *histReq) {
+	v, err := req.fn(n.fsm.HistoryView())
+	req.rc <- histOutcome{val: v, err: err}
+}
+
+// queryHistory 把一条历史查询投递到事件循环并等待结果。
+func (n *Node) queryHistory(fn func(h *History) (any, error)) (any, error) {
+	rc := make(chan histOutcome, 1)
+	select {
+	case n.eventCh <- event{hist: &histReq{fn: fn, rc: rc}}:
+	case <-n.stopCh:
+		return nil, ErrStopped
+	}
+	select {
+	case out := <-rc:
+		return out.val, out.err
+	case <-n.stopCh:
+		return nil, ErrStopped
+	}
+}
+
+// AppliedIndex 返回本节点已应用到状态机的最大日志下标。
+// 历史查询对 <= AppliedIndex 的位置必然可用且结论确定。
+func (n *Node) AppliedIndex() int64 { return n.atomicApplied.Load() }
+
+// ResourceHistory 返回某资源在本节点已应用日志上的完整归属历史。
+func (n *Node) ResourceHistory(resource string) (ResourceHistory, error) {
+	v, err := n.queryHistory(func(h *History) (any, error) {
+		return h.Resource(resource), nil
+	})
+	if err != nil {
+		return ResourceHistory{}, err
+	}
+	return v.(ResourceHistory), nil
+}
+
+// StateAt 重建某资源在历史位置的持有者、令牌与到期情况。
+func (n *Node) StateAt(resource string, pos HistoryPosition) (LockStateAt, error) {
+	v, err := n.queryHistory(func(h *History) (any, error) {
+		return h.StateAt(resource, pos)
+	})
+	if err != nil {
+		return LockStateAt{}, err
+	}
+	return v.(LockStateAt), nil
+}
+
+// ValidateAt 判定携带令牌的提交放在历史位置是否通过，结论与当时一致。
+func (n *Node) ValidateAt(resource, owner string, token int64, pos HistoryPosition) (ValidateResult, error) {
+	v, err := n.queryHistory(func(h *History) (any, error) {
+		return h.ValidateAt(resource, owner, token, pos)
+	})
+	if err != nil {
+		res, _ := v.(ValidateResult)
+		return res, err
+	}
+	return v.(ValidateResult), nil
+}
+
+// ExportHistory 导出本节点已应用日志派生的全量历史（深拷贝）。
+func (n *Node) ExportHistory() (ExportedHistory, error) {
+	v, err := n.queryHistory(func(h *History) (any, error) {
+		return h.Export(fmt.Sprintf("node-%d", n.cfg.ID)), nil
+	})
+	if err != nil {
+		return ExportedHistory{}, err
+	}
+	return v.(ExportedHistory), nil
 }
 
 func min64(a, b int64) int64 {

@@ -209,3 +209,100 @@ func (s *LockService) Lookup(ctx context.Context, resource string) (LockState, e
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 归属历史与历史时点重建（只读；不改变任何锁语义）
+// ---------------------------------------------------------------------------
+
+// historyNodes 返回可服务历史查询的节点：自认领导者在前（通常最新），
+// 其余可达节点在后。历史由已提交日志派生，任何节点就已应用的位置
+// 给出的答案都完全一致。
+func (s *LockService) historyNodes() []*Node {
+	seen := map[int]bool{}
+	var nodes []*Node
+	for _, n := range s.leaderCandidates() {
+		seen[n.cfg.ID] = true
+		nodes = append(nodes, n)
+	}
+	for i := 0; i < s.cluster.Size(); i++ {
+		if s.cluster.Network().IsDown(i) || seen[i] {
+			continue
+		}
+		if n := s.cluster.Node(i); n != nil {
+			nodes = append(nodes, n)
+		}
+	}
+	return nodes
+}
+
+// queryHistory 依次尝试各节点执行历史查询；位置超出某节点已应用范围
+// （ErrHistoryBeyond）时换更新的节点重试。业务性结论（如栅栏拒绝）
+// 连同其负载一并返回，不重试。
+func (s *LockService) queryHistory(ctx context.Context, q func(*Node) (any, error)) (any, error) {
+	var lastErr error
+	for _, node := range s.historyNodes() {
+		v, err := q(node)
+		if err == nil {
+			return v, nil
+		}
+		if errors.Is(err, ErrHistoryBeyond) || errors.Is(err, ErrStopped) {
+			lastErr = err
+			continue
+		}
+		// 业务结论（含拒绝原因负载）：原样返回。
+		return v, err
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return nil, ErrUnreachable
+}
+
+// HistoryOf 返回某资源从首次加锁到当前的完整归属历史。
+func (s *LockService) HistoryOf(ctx context.Context, resource string) (ResourceHistory, error) {
+	v, err := s.queryHistory(ctx, func(n *Node) (any, error) {
+		return n.ResourceHistory(resource)
+	})
+	if err != nil {
+		return ResourceHistory{}, err
+	}
+	return v.(ResourceHistory), nil
+}
+
+// StateAt 重建某资源在历史位置（日志下标或时间点）的锁状态。
+func (s *LockService) StateAt(ctx context.Context, resource string, pos HistoryPosition) (LockStateAt, error) {
+	v, err := s.queryHistory(ctx, func(n *Node) (any, error) {
+		return n.StateAt(resource, pos)
+	})
+	if err != nil {
+		return LockStateAt{}, err
+	}
+	return v.(LockStateAt), nil
+}
+
+// ValidateAt 判定携带令牌的提交放在历史位置是否通过，结论与当时一致。
+func (s *LockService) ValidateAt(ctx context.Context, resource, owner string, token int64, pos HistoryPosition) (ValidateResult, error) {
+	v, err := s.queryHistory(ctx, func(n *Node) (any, error) {
+		return n.ValidateAt(resource, owner, token, pos)
+	})
+	res, _ := v.(ValidateResult)
+	if err != nil {
+		return res, err
+	}
+	return res, nil
+}
+
+// ExportHistory 导出全量归属历史（含各日志下标的时间戳），
+// 内容确定，可序列化后跨节点、跨重放、跨运行比较。
+func (s *LockService) ExportHistory(ctx context.Context) (ExportedHistory, error) {
+	v, err := s.queryHistory(ctx, func(n *Node) (any, error) {
+		return n.ExportHistory()
+	})
+	if err != nil {
+		return ExportedHistory{}, err
+	}
+	return v.(ExportedHistory), nil
+}

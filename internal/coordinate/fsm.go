@@ -5,10 +5,17 @@ import "time"
 // lockFSM 是锁服务的确定性状态机，只由已提交日志驱动。
 // 任何"锁是否有效""令牌是否最新"的结论都只在这里产生，
 // 从而保证所有节点对同一日志前缀得到完全一致的结论。
+//
+// 确定性时间：租约判定一律使用日志条目里领导者盖的时间戳（Op.Time），
+// 而不是各节点 apply 时的本地墙钟；因此同一日志在所有节点、以及重启
+// 重放后，产生完全一致的状态与归属历史。
 type lockFSM struct {
 	locks    map[string]LockState
 	maxToken map[string]int64
 	dedup    map[string]DedupEntry
+
+	history *History
+	applied int64 // 已应用的最大日志下标（index<=0 时用于自动编号）
 }
 
 // NewFSM 创建空的锁状态机。
@@ -17,15 +24,18 @@ func NewFSM() FSM {
 		locks:    map[string]LockState{},
 		maxToken: map[string]int64{},
 		dedup:    map[string]DedupEntry{},
+		history:  newHistory(),
 	}
 }
 
 // NewFSMFromSnapshot 从快照重建状态机（节点重放历史日志后使用）。
+// 注意：快照不含归属历史；历史由完整日志重放重建（本实现不做日志压缩）。
 func NewFSMFromSnapshot(snap FSMSnapshot) FSM {
 	f := &lockFSM{
 		locks:    map[string]LockState{},
 		maxToken: map[string]int64{},
 		dedup:    map[string]DedupEntry{},
+		history:  newHistory(),
 	}
 	for k, v := range snap.Locks {
 		f.locks[k] = v
@@ -39,10 +49,33 @@ func NewFSMFromSnapshot(snap FSMSnapshot) FSM {
 	return f
 }
 
+// HistoryView 返回随已提交日志维护的归属历史。
+func (f *lockFSM) HistoryView() *History { return f.history }
+
+// effectiveTime 解析本条日志使用的确定性时间：
+// 优先取领导者提议时盖在 Op 上的时间戳；旧日志/直接测试调用回退到 now。
+// 统一转为 UTC（同时剥离单调时钟读数），保证导出内容可逐字节比较。
+func effectiveTime(op Op, now time.Time) time.Time {
+	t := op.Time
+	if t.IsZero() {
+		t = now
+	}
+	return t.UTC()
+}
+
 // Apply 按顺序应用一条已提交日志。
 // 幂等语义：相同 RequestID 永远返回首次提交时的结论（成功或拒绝），
 // 不会造成重复加锁、重复释放或令牌跳变。
-func (f *lockFSM) Apply(op Op, now time.Time) (any, error) {
+func (f *lockFSM) Apply(op Op, index int64, now time.Time) (any, error) {
+	if index <= 0 {
+		index = f.applied + 1
+	}
+	f.applied = index
+	t := effectiveTime(op, now)
+	// 每条已应用日志都登记时间（含 no-op、被拒绝与幂等重放的条目），
+	// 使任意日志下标都能作为历史位置参与"那一刻是否到期"的判定。
+	f.history.noteEntry(index, t)
+
 	if op.RequestID != "" {
 		if prev, ok := f.dedup[op.RequestID]; ok {
 			return prev.Result, prev.Code.Error()
@@ -61,13 +94,13 @@ func (f *lockFSM) Apply(op Op, now time.Time) (any, error) {
 		}
 		return struct{}{}, nil
 	case OpAcquire:
-		result, err = f.applyAcquire(op, now)
+		result, err = f.applyAcquire(op, index, t)
 	case OpRenew:
-		result, err = f.applyRenew(op, now)
+		result, err = f.applyRenew(op, index, t)
 	case OpRelease:
-		result, err = f.applyRelease(op, now)
+		result, err = f.applyRelease(op, index, t)
 	case OpValidate:
-		result, err = f.applyValidate(op, now)
+		result, err = f.applyValidate(op, t)
 	}
 
 	if op.RequestID != "" {
@@ -85,7 +118,7 @@ func (f *lockFSM) Apply(op Op, now time.Time) (any, error) {
 //   - 资源无锁或旧租约已过期：发放新的、严格递增的栅栏令牌；
 //   - 同一 owner 在有效租约内重入：仅延长到期时间，令牌不变；
 //   - 其他 owner 仍持有效租约：以 ErrHeldByOther 明确拒绝。
-func (f *lockFSM) applyAcquire(op Op, now time.Time) (LockResult, error) {
+func (f *lockFSM) applyAcquire(op Op, index int64, now time.Time) (LockResult, error) {
 	if op.Resource == "" {
 		return LockResult{}, ErrEmptyResource
 	}
@@ -106,6 +139,7 @@ func (f *lockFSM) applyAcquire(op Op, now time.Time) (LockResult, error) {
 		// 同一持有者重入：延长租约，绝不发放新令牌。
 		cur.LeaseUntil = now.Add(ttl)
 		f.locks[op.Resource] = cur
+		f.history.recordAcquire(index, now, op, cur, true)
 		return lockResultOf(cur, now), nil
 	}
 
@@ -122,6 +156,7 @@ func (f *lockFSM) applyAcquire(op Op, now time.Time) (LockResult, error) {
 		Term:       op.Term,
 	}
 	f.locks[op.Resource] = state
+	f.history.recordAcquire(index, now, op, state, false)
 	return lockResultOf(state, now), nil
 }
 
@@ -130,7 +165,7 @@ func (f *lockFSM) applyAcquire(op Op, now time.Time) (LockResult, error) {
 //   - 租约已过期：ErrLeaseExpired（原持有者已失去保护，必须重新抢锁拿新令牌）；
 //   - 令牌落后于当前代：ErrFenceTokenStale（锁虽有效，但已被更新持有者接管）；
 //   - 其余：延长到期时间，令牌保持不变。
-func (f *lockFSM) applyRenew(op Op, now time.Time) (LockResult, error) {
+func (f *lockFSM) applyRenew(op Op, index int64, now time.Time) (LockResult, error) {
 	cur, ok := f.locks[op.Resource]
 	if !ok {
 		return LockResult{}, ErrWrongOwner
@@ -150,6 +185,7 @@ func (f *lockFSM) applyRenew(op Op, now time.Time) (LockResult, error) {
 	}
 	cur.LeaseUntil = now.Add(ttl)
 	f.locks[op.Resource] = cur
+	f.history.recordRenew(index, now, op, cur)
 	return lockResultOf(cur, now), nil
 }
 
@@ -157,7 +193,7 @@ func (f *lockFSM) applyRenew(op Op, now time.Time) (LockResult, error) {
 //   - 不存在视为成功（释放幂等）；
 //   - owner 不符：ErrWrongOwner；
 //   - 携带的令牌落后：ErrFenceTokenStale，拒绝释放别人的一代。
-func (f *lockFSM) applyRelease(op Op, now time.Time) (struct{}, error) {
+func (f *lockFSM) applyRelease(op Op, index int64, now time.Time) (struct{}, error) {
 	cur, ok := f.locks[op.Resource]
 	if !ok {
 		return struct{}{}, nil
@@ -170,6 +206,7 @@ func (f *lockFSM) applyRelease(op Op, now time.Time) (struct{}, error) {
 	}
 	delete(f.locks, op.Resource)
 	// maxToken 保留：即使释放后重新加锁，令牌也只增不减。
+	f.history.recordRelease(index, now, op)
 	return struct{}{}, nil
 }
 

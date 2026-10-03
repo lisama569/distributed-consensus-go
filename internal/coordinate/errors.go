@@ -28,4 +28,8 @@ var (
 	ErrUnreachable = errors.New("coordinate: peer unreachable")
 	// ErrTimeout RPC 超时。
 	ErrTimeout = errors.New("coordinate: rpc timeout")
+	// ErrHistoryBeyond 查询的历史位置超出该节点已应用的日志范围。
+	ErrHistoryBeyond = errors.New("coordinate: history position beyond applied log")
+	// ErrHistoryPosition 历史位置参数无效（既未给日志下标也未给时间点）。
+	ErrHistoryPosition = errors.New("coordinate: invalid history position")
 )

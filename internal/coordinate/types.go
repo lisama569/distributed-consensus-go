@@ -34,11 +34,15 @@ type LockResult struct {
 // FSM 是锁状态机接口：只通过已提交日志推进，绝不接受旁路写入。
 type FSM interface {
 	// Apply 按顺序应用一条已提交日志，返回操作结论。
-	Apply(op Op, now time.Time) (any, error)
+	// index 是该日志的下标（>0）；传 0 时由状态机按已应用条数自动编号，
+	// 供不经过日志的单元测试使用。
+	Apply(op Op, index int64, now time.Time) (any, error)
 	// Snapshot 返回状态快照（用于新领导者/重启后的读状态）。
 	Snapshot() FSMSnapshot
 	// Lookup 返回某资源当前锁状态（不修改状态）。
 	Lookup(resource string) (LockState, bool)
+	// HistoryView 返回随已提交日志维护的归属历史（只增不改）。
+	HistoryView() *History
 }
 
 // LockState 是单个资源的锁状态。
@@ -160,6 +164,11 @@ type Op struct {
 	Token     int64         `json:"token"` // renew/release/validate 时携带
 	TTL       time.Duration `json:"ttl_nanos"`
 	Term      int64         `json:"term"` // 提议该操作时的领导者任期
+	// Time 是领导者在提议该操作时盖的时间戳，随日志一起复制与持久化。
+	// 状态机的租约判定与归属历史都以它为准（而不是各节点 apply 时的本地墙钟），
+	// 因此所有节点对同一日志前缀得到完全一致的状态与历史，重启重放也不变。
+	// 零值（旧日志或测试直接调用 FSM）时回退到 Apply 传入的 now。
+	Time time.Time `json:"time"`
 }
 
 // ValidateResult 是受保护操作（栅栏校验）的结论。
