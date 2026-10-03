@@ -171,8 +171,30 @@ func main() {
 	must(err)
 	logger.Printf("  client-D 接管 orders/1，新令牌=%d（严格高于旧令牌 %d）", r4.Token, r.Token)
 
+	// 8) 归属历史与历史时点重建
 	fmt.Println()
-	logger.Printf("=== 全部演示结论符合预期：单主、多数派、任期单调、令牌单调、幂等、过期拒绝 ===")
+	logger.Printf("【归属历史】orders/1 从首次加锁至今的完整归属变化：")
+	spans, err := svc.OwnershipHistory(ctx, "orders/1")
+	must(err)
+	for i, sp := range spans {
+		logger.Printf("  段%d 持有者=%s 令牌=%d 开始位置seq=%d 续约=%d次 结束位置seq=%d 结束原因=%s",
+			i, sp.Owner, sp.Token, sp.StartSeq, len(sp.Renewals), sp.EndSeq, sp.EndReason)
+	}
+	// 把 client-A 的旧令牌放回它第一次持锁的位置：当时是通过的；
+	// 放回 client-D 接管之后的位置：当时就会被栅栏拒绝。
+	first := spans[0]
+	vrOld, err := svc.ValidateAt(ctx, "orders/1", first.StartSeq, "client-A", r.Token)
+	must(err)
+	logger.Printf("【时点重建】令牌 %d 放回位置 seq=%d => accepted=%v reason=%s（与当时结论一致）",
+		r.Token, first.StartSeq, vrOld.Accepted, vrOld.Reason)
+	last := spans[len(spans)-1]
+	if _, verr := svc.ValidateAt(ctx, "orders/1", last.StartSeq, "client-A", r.Token); verr != nil {
+		logger.Printf("【时点重建】令牌 %d 放回位置 seq=%d => 拒绝：%v（与当时结论一致）",
+			r.Token, last.StartSeq, verr)
+	}
+
+	fmt.Println()
+	logger.Printf("=== 全部演示结论符合预期：单主、多数派、任期单调、令牌单调、幂等、过期拒绝、历史可追溯 ===")
 }
 
 func must(err error) {

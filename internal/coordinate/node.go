@@ -32,6 +32,8 @@ type NodeConfig struct {
 	Heartbeat   time.Duration
 	RPCTimeout  time.Duration
 	Logger      *log.Logger
+	// Seed 非 0 时选举随机源使用固定种子（确定性测试可复现选举时序）。
+	Seed int64
 }
 
 // event 是节点串行事件循环处理的所有输入。
@@ -41,6 +43,7 @@ type event struct {
 
 	sub  *submitReq
 	read *readReq
+	hist *histReq
 }
 
 type submitReq struct {
@@ -62,6 +65,18 @@ type readOutcome struct {
 	state LockState
 	found bool
 	err   error
+}
+
+// histReq 是一条只读历史查询：在事件循环内对历史投影执行 fn 并回传结果。
+// 历史是已提交日志的确定性投影，任意节点（含跟随者）都可安全服务。
+type histReq struct {
+	fn func(h *Historian) (any, error)
+	rc chan histOutcome
+}
+
+type histOutcome struct {
+	val any
+	err error
 }
 
 // NodeStatus 是节点当前的协调角色快照。
@@ -138,6 +153,10 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	if cfg.RPCTimeout == 0 {
 		cfg.RPCTimeout = defaultRPCTimeout
 	}
+	seed := int64(cfg.ID)*1000003 + time.Now().UnixNano()
+	if cfg.Seed != 0 {
+		seed = cfg.Seed + int64(cfg.ID)*1000003
+	}
 	return &Node{
 		cfg:        cfg,
 		votedFor:   -1,
@@ -151,7 +170,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 		waiters:    map[int64][]chan submitOutcome{},
-		rng:        rand.New(rand.NewSource(int64(cfg.ID)*1000003 + time.Now().UnixNano())),
+		rng:        rand.New(rand.NewSource(seed)),
 	}, nil
 }
 
@@ -253,6 +272,73 @@ func (n *Node) ReadState(resource string) (LockState, bool, error) {
 	return out.state, out.found, out.err
 }
 
+// queryHistory 在事件循环内执行只读历史查询（任意节点可服务）。
+func (n *Node) queryHistory(fn func(h *Historian) (any, error)) (any, error) {
+	rc := make(chan histOutcome, 1)
+	select {
+	case n.eventCh <- event{hist: &histReq{fn: fn, rc: rc}}:
+	case <-n.stopCh:
+		return nil, ErrStopped
+	}
+	out := <-rc
+	return out.val, out.err
+}
+
+// OwnershipHistory 返回某资源从首次加锁至今的完整归属段（按开始位置升序）。
+func (n *Node) OwnershipHistory(resource string) ([]OwnershipSpan, error) {
+	val, err := n.queryHistory(func(h *Historian) (any, error) {
+		return h.Spans(resource), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return val.([]OwnershipSpan), nil
+}
+
+// HistoryEvents 返回某资源的全部审计事件（每次提交的结论与原因）。
+func (n *Node) HistoryEvents(resource string) ([]HistoryEvent, error) {
+	val, err := n.queryHistory(func(h *Historian) (any, error) {
+		return h.Events(resource), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return val.([]HistoryEvent), nil
+}
+
+// StateAt 重建某资源在历史位置 seq 的持有者/令牌/到期情况。
+func (n *Node) StateAt(resource string, seq int64) (HistoricalState, error) {
+	val, err := n.queryHistory(func(h *Historian) (any, error) {
+		return h.StateAt(resource, seq)
+	})
+	if err != nil {
+		return HistoricalState{}, err
+	}
+	return val.(HistoricalState), nil
+}
+
+// ValidateAt 判定携带 token 的提交放在历史位置 seq 是否通过。
+func (n *Node) ValidateAt(resource string, seq int64, owner string, token int64) (ValidateResult, error) {
+	val, err := n.queryHistory(func(h *Historian) (any, error) {
+		return h.ValidateAt(resource, seq, owner, token)
+	})
+	if err != nil {
+		return ValidateResult{}, err
+	}
+	return val.(ValidateResult), nil
+}
+
+// ExportHistory 导出该节点已投影的全部历史（RunID 由调用方填写）。
+func (n *Node) ExportHistory() (HistoryExport, error) {
+	val, err := n.queryHistory(func(h *Historian) (any, error) {
+		return h.Export(), nil
+	})
+	if err != nil {
+		return HistoryExport{}, err
+	}
+	return val.(HistoryExport), nil
+}
+
 // Term 返回当前已知最大任期（任期只会单调递增）。
 func (n *Node) Term() int64 { return n.atomicTerm.Load() }
 
@@ -347,6 +433,9 @@ func (n *Node) handleEvent(e event, resetElection func()) {
 		n.handleSubmit(e.sub)
 	case e.read != nil:
 		n.handleRead(e.read)
+	case e.hist != nil:
+		val, err := e.hist.fn(n.fsm.History())
+		e.hist.rc <- histOutcome{val: val, err: err}
 	}
 }
 
@@ -402,6 +491,12 @@ func (n *Node) startElection() {
 	n.cfg.Logger.Printf("[node %d] -> candidate term=%d (election timeout, seeking majority)",
 		n.cfg.ID, n.term)
 
+	// 单节点集群：自投即多数派，立即上任（没有投票响应会再触发检查）。
+	if len(n.votes) > len(n.cfg.Peers)/2 {
+		n.becomeLeader()
+		return
+	}
+
 	req := Message{
 		Type:         MsgVote,
 		Term:         n.term,
@@ -451,9 +546,14 @@ func (n *Node) becomeLeader() {
 
 	// 上任先提交一条 no-op：在它被多数派确认前，本任期不对外提供读，
 	// 从而不会把旧领导者可能尚未提交的状态当成新结论。
-	noop := LogEntry{Index: last + 1, Term: n.term, Op: Op{Kind: OpNoop, Term: n.term}}
+	noop := LogEntry{Index: last + 1, Term: n.term, Op: Op{
+		Kind: OpNoop, Term: n.term, Seq: last + 1, At: n.cfg.Clock.Now(),
+	}}
 	n.logs.Append([]LogEntry{noop})
 	n.registerWaiter(noop.Index, nil)
+	// 单节点集群没有复制响应可触发提交推进，本地追加后即尝试提交；
+	// 多节点下此处多数派不成立，行为不变。
+	n.advanceCommitIndex()
 	n.broadcastAppend()
 }
 
@@ -689,10 +789,16 @@ func (n *Node) handleSubmit(req *submitReq) {
 	op := req.op
 	op.Term = n.term
 	idx := n.logs.LastIndex() + 1
+	// 领导者在追加前盖章日志下标与时间：历史投影只依赖这两个字段，
+	// 从而同一份日志在任意节点、任意次重放后得到完全一致的历史。
+	op.Seq = idx
+	op.At = n.cfg.Clock.Now()
 	// 必须先登记 waiter 再追加/广播：否则快速返回的复制响应可能在
 	// 登记之前就推进提交并 notifyWaiters，导致本次提交永久等待。
 	n.registerWaiter(idx, req.rc)
 	n.logs.Append([]LogEntry{{Index: idx, Term: n.term, Op: op}})
+	// 单节点集群：本地追加即构成多数派，立即尝试推进提交。
+	n.advanceCommitIndex()
 	n.broadcastAppend()
 }
 

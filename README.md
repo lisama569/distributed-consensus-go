@@ -8,6 +8,9 @@
 - **严格单调的栅栏令牌（fencing token）**
 - **重复请求 / 重放的幂等处理**
 - **网络分区、租约到期、节点宕机、进程重启**的故障注入与可解释判定
+- **归属历史与历史时点重建**：每个资源从首次加锁至今"谁持有、哪个令牌、
+  何时开始、续约到何处、因何结束"全程可追溯，且可把任意携带令牌的提交
+  放回历史位置，得到与当时一致的通过/拒绝结论
 
 所有“谁是主、锁归谁、令牌是否有效”的结论都只由**复制到多数派的日志驱动的
 确定性状态机**产生，因此结论可预期、可重放、可解释。
@@ -27,7 +30,9 @@ internal/coordinate/
   logstore.go      内存日志存储 + 内存任期存储
   persistence.go   FileStore：currentTerm/votedFor/日志 的 JSON 原子落盘
   lock.go          LockService：客户端 API，负责发现并路由到当前领导者
-  *_test.go        选举、锁语义、分区、租约、重启测试
+  history.go       归属历史投影：OwnershipSpan / HistoryEvent / 时点重建 / 导出
+  clock.go         ManualClock：手动时钟，用于跨运行完全确定的历史
+  *_test.go        选举、锁语义、分区、租约、重启、归属历史测试
 cmd/demo/main.go   端到端可运行演示
 ```
 
@@ -120,7 +125,61 @@ cmd/demo/main.go   端到端可运行演示
 
 ---
 
-## 4. 故障注入方式
+## 4. 归属历史与历史时点重建（可追溯层）
+
+在原有租约/栅栏语义之上，系统把**已提交日志**投影成一份只增不改的归属历史，
+用于事后排查"这块资源在某个时刻到底归谁、当时那次提交为什么通过或被拒"。
+
+### 4.1 语义
+
+- **历史位置（position）= 日志下标 `Seq`**：全序、可比较、随日志持久化，
+  重启之后仍能定位到同一个位置。领导者提交每条操作时把 `Seq` 与盖章时间
+  `At` 写进日志（`Op.Seq` / `Op.At`），历史投影只使用这两个字段，
+  因此同一份日志在**任意节点、任意时刻、任意次重启重放**后得到
+  **完全一致**的历史；把同一段操作在全新节点上重放亦然。
+- **归属段 `OwnershipSpan`**：一段连续归属 = 持有者、栅栏令牌、开始位置/时刻、
+  每次续约延长到的位置（`Renewals`）、结束位置与结束原因
+  （`released` 主动释放 / `expired` 租约到期被观察到 / `taken_over` 被新持有者接管）。
+  段按 `StartSeq` 严格递增排列；**已关闭的段永不被改写或重排**，
+  进行中的段只允许追加续约与结束信息。
+- **审计事件 `HistoryEvent`**：每条已提交操作（含被拒绝、含幂等重放）都记录
+  位置、盖章时间、操作类型、requestID、令牌与结论（`accepted` + 可区分 `reason`）。
+- **时点重建 `StateAt(resource, seq)`**：还原该位置的持有者、令牌、
+  租约到期时刻与"当时是否已过期"。
+- **时点判定 `ValidateAt(resource, seq, owner, token)`**：回答"这个携带令牌的
+  提交放在那个时刻算不算通过"，结论与当时状态机的判定一致
+  （`lease_expired` / `fence_token_stale` / `wrong_owner` / `ok`）。
+- **导出 `ExportHistory(runID)`**：全量历史的确定性文本（`Canonical()`）。
+  同一套操作场景独立跑两遍，除 `RunID` 外导出内容完全一致
+  （可用 `WithClock(手动时钟)` + `WithRandomSeed(固定种子)` 获得含时间戳在内的
+  逐字节一致）。
+
+### 4.2 与现有租约/栅栏行为的兼容范围
+
+- **原有接口与结论完全不变**：选主、加锁、续约、释放、栅栏校验、幂等重放的
+  判定逻辑一行未改；历史层是日志的**只读投影**，不反哺、不影响在线判定。
+- 在线判定仍使用各节点 apply 时的本地时钟（原有行为）；历史投影使用领导者
+  盖章时间 `Op.At`。两者在正常情况下一致，仅在"租约恰好于提交与盖章之间的
+  毫秒级窗口内到期"的边界情形可能相差一个判定——此时以在线结论为准，
+  历史给出的是按盖章时间重放的确定性解释（这也是跨节点一致的唯一方式）。
+- 历史查询可由**任意存活节点**服务（领导者候选优先）：同一历史位置
+  在任意节点查询结果一致；位置超出某节点已投影范围时返回
+  `ErrPositionUnknown`，客户端会换节点重试。
+- 重启无需额外持久化：历史随日志重放确定性重建，重启前后逐字节一致。
+
+### 4.3 查询 API
+
+```go
+svc.OwnershipHistory(ctx, resource)        // 完整归属段序列
+svc.HistoryEvents(ctx, resource)           // 全部审计事件（含拒绝原因）
+svc.StateAt(ctx, resource, seq)            // 某历史位置的持有者/令牌/到期情况
+svc.ValidateAt(ctx, resource, seq, owner, token) // 该位置上的栅栏判定
+svc.ExportHistory(ctx, runID)              // 全量导出（Canonical() 可比对）
+```
+
+---
+
+## 5. 故障注入方式
 
 `coordinate.SimNetwork` 是所有节点共享的内存网络，提供：
 
@@ -149,11 +208,11 @@ net.Set.SetDelay(20 * time.Millisecond)
 
 ---
 
-## 5. 本地验证方法
+## 6. 本地验证方法
 
 要求 Go 1.25+（本模块在 go 1.25/1.26 工具链验证）。
 
-### 5.1 运行全部测试
+### 6.1 运行全部测试
 
 ```bash
 go test ./... -count=1                 # 功能测试
@@ -161,6 +220,7 @@ go test ./... -race -count=1           # 含竞态检测
 go test ./... -count=10                # 多轮重复，验证稳定性
 go test ./internal/coordinate/ -run TestElection -v   # 只看选主
 go test ./internal/coordinate/ -run TestLock -v       # 只看锁/租约/栅栏
+go test ./internal/coordinate/ -run TestHistory -v    # 只看归属历史/时点重建
 ```
 
 测试覆盖：
@@ -175,11 +235,17 @@ go test ./internal/coordinate/ -run TestLock -v       # 只看锁/租约/栅栏
 | `TestLock_LeaseExpiryBlocksOldOwner` | 续约失败 + 旧令牌受保护操作被拒 + 新主令牌更高 |
 | `TestLock_PartitionedOldLeaderCannotCommit` | 分区旧主提交被阻断，多数派正常服务，恢复后单主 |
 | `TestLock_RestartLeaderKeepsTermAndLockState` | 磁盘重启 term/锁/令牌不回退，释放后令牌继续递增 |
+| `TestHistorian_ProjectionMatchesFSM` | 同一日志流，历史投影结论与状态机逐条一致；段结束原因正确 |
+| `TestHistory_OwnershipSpansStableOrdered` | 归属段顺序稳定、令牌递增、结束原因正确、已关闭段不被改写 |
+| `TestHistory_ValidateAtMatchesLiveDecisions` | 把提交放回当时位置，重建判定与当时实际结论逐一一致 |
+| `TestHistory_ConsistentAcrossNodesAndRestart` | 各节点历史逐字节一致；滚动重启后历史与时点重建不变 |
+| `TestHistory_DeterministicAcrossRuns` | 同一场景独立跑两遍，导出历史除 RunID 外完全一致 |
+| `TestHistory_ConcurrentMultiResource` | 100 资源 × 8 客户端 × 约 2500 次操作：不变量、跨节点一致、查询延迟 |
 
 测试日志会打印 **任期（term）、持有者（owner）、栅栏令牌（token）与判定依据
 （accepted/reason）**，便于核对。
 
-### 5.2 运行端到端演示
+### 6.2 运行端到端演示
 
 ```bash
 go run ./cmd/demo -nodes 5 -data-dir demo-data
@@ -188,7 +254,8 @@ go run ./cmd/demo -nodes 5 -data-dir demo-data
 演示会依次打印：选主 → 加锁/令牌/栅栏接受 → 重复请求幂等 → 注入分区
 （少数派旧主提交被阻断、多数派选出 term 更高的新主）→ 恢复分区单主 →
 续约 → 重启领导者（term/锁状态不回退）→ 等待租约过期 → 旧令牌被明确拒绝 →
-新持有者拿到更高令牌。
+新持有者拿到更高令牌 → 打印该资源完整归属历史（每段的持有者/令牌/起止位置/
+结束原因），并把旧令牌放回两个不同历史位置做时点重建，验证结论与当时一致。
 
 落盘内容可直接查看：
 
@@ -198,7 +265,7 @@ cat demo-data/cluster/node-0.json   # currentTerm / votedFor / 已复制日志
 
 ---
 
-## 6. 安全性质一览（本实现如何保证）
+## 7. 安全性质一览（本实现如何保证）
 
 | 性质 | 保证手段 |
 | --- | --- |
@@ -211,10 +278,13 @@ cat demo-data/cluster/node-0.json   # currentTerm / votedFor / 已复制日志
 | 栅栏令牌严格单调可比 | 每资源 `maxToken` 只增不减，新代次 +1，重启经日志重放恢复 |
 | 重复请求不产生重复副作用 | `RequestID` 去重表，重放返回首次结论 |
 | 失效令牌被明确拒绝 | `lease_expired / fence_token_stale / wrong_owner` 三类可区分原因 |
+| 归属历史不可改写、顺序稳定 | 历史是已提交日志的追加式投影，位置=日志下标 |
+| 历史结论跨节点/跨重启一致 | 投影只依赖日志内的 `Op.Seq`/`Op.At`，与查询节点、时机无关 |
+| 历史时点判定与当时一致 | `ValidateAt` 按当时重建状态重放栅栏规则，测试逐事件核对 |
 
 ---
 
-## 7. 已知边界（原型范围）
+## 8. 已知边界（原型范围）
 
 - 租约到期判定依赖**各节点本地墙钟**（本机模拟中时钟一致）；跨机器部署需用
   有界时钟偏移假设或接入逻辑时钟。

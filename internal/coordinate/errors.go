@@ -24,6 +24,9 @@ var (
 	ErrEmptyRequestID = errors.New("coordinate: empty request id")
 	// ErrStopped 节点已停止。
 	ErrStopped = errors.New("coordinate: node stopped")
+	// ErrPositionUnknown 查询的历史位置超出该节点已投影的日志范围
+	// （位置太新，节点尚未复制到）；换个节点或稍后重试即可。
+	ErrPositionUnknown = errors.New("coordinate: history position not yet known")
 	// ErrUnreachable 对端不可达（宕机或被分区）。
 	ErrUnreachable = errors.New("coordinate: peer unreachable")
 	// ErrTimeout RPC 超时。

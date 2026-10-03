@@ -9,6 +9,7 @@ type lockFSM struct {
 	locks    map[string]LockState
 	maxToken map[string]int64
 	dedup    map[string]DedupEntry
+	hist     *Historian // 归属历史投影：只由已提交日志推导，跨节点/重启一致
 }
 
 // NewFSM 创建空的锁状态机。
@@ -17,6 +18,7 @@ func NewFSM() FSM {
 		locks:    map[string]LockState{},
 		maxToken: map[string]int64{},
 		dedup:    map[string]DedupEntry{},
+		hist:     NewHistorian(),
 	}
 }
 
@@ -26,6 +28,7 @@ func NewFSMFromSnapshot(snap FSMSnapshot) FSM {
 		locks:    map[string]LockState{},
 		maxToken: map[string]int64{},
 		dedup:    map[string]DedupEntry{},
+		hist:     NewHistorian(),
 	}
 	for k, v := range snap.Locks {
 		f.locks[k] = v
@@ -43,6 +46,10 @@ func NewFSMFromSnapshot(snap FSMSnapshot) FSM {
 // 幂等语义：相同 RequestID 永远返回首次提交时的结论（成功或拒绝），
 // 不会造成重复加锁、重复释放或令牌跳变。
 func (f *lockFSM) Apply(op Op, now time.Time) (any, error) {
+	// 先把该条目投影进归属历史：投影只依赖日志内容（Seq/At/操作字段），
+	// 与本次 apply 的本地时钟无关，因此所有节点与重启重放得到同一历史。
+	f.hist.Apply(op, now)
+
 	if op.RequestID != "" {
 		if prev, ok := f.dedup[op.RequestID]; ok {
 			return prev.Result, prev.Code.Error()
@@ -210,6 +217,9 @@ func lockResultOf(s LockState, now time.Time) LockResult {
 		Term:       s.Term,
 	}
 }
+
+// History 返回归属历史投影器（只读视图）。
+func (f *lockFSM) History() *Historian { return f.hist }
 
 // Snapshot 返回深拷贝快照，读操作绝不触碰可变状态。
 func (f *lockFSM) Lookup(resource string) (LockState, bool) {

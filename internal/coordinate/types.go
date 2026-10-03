@@ -39,6 +39,8 @@ type FSM interface {
 	Snapshot() FSMSnapshot
 	// Lookup 返回某资源当前锁状态（不修改状态）。
 	Lookup(resource string) (LockState, bool)
+	// History 返回归属历史投影器（只读视图；与状态机同受事件循环保护）。
+	History() *Historian
 }
 
 // LockState 是单个资源的锁状态。
@@ -160,6 +162,13 @@ type Op struct {
 	Token     int64         `json:"token"` // renew/release/validate 时携带
 	TTL       time.Duration `json:"ttl_nanos"`
 	Term      int64         `json:"term"` // 提议该操作时的领导者任期
+	// Seq 是该操作在日志中的下标，由领导者在追加前填写并随日志复制。
+	// 它同时是归属历史中的"位置"：全序、可比较、重启后仍可定位。
+	Seq int64 `json:"seq,omitempty"`
+	// At 是领导者提交本操作时的盖章时间，随日志复制与落盘。
+	// 归属历史只使用 At（而非各节点 apply 时的本地时钟），
+	// 从而保证同一份日志在任意节点、任意次重放后投影出完全一致的历史。
+	At time.Time `json:"at,omitempty"`
 }
 
 // ValidateResult 是受保护操作（栅栏校验）的结论。

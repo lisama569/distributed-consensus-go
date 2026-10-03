@@ -209,3 +209,127 @@ func (s *LockService) Lookup(ctx context.Context, resource string) (LockState, e
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 归属历史查询
+//
+// 历史是已提交日志的确定性投影：同一历史位置在任意节点、任意时刻、
+// 反复重启后查询，结果完全一致。因此历史查询可由任意存活节点服务
+// （领导者候选优先，保证位置较新；位置超出某节点已投影范围时会换节点重试）。
+// ---------------------------------------------------------------------------
+
+// queryAnyNode 依次在候选节点上执行只读历史查询，直到某个节点成功。
+func (s *LockService) queryAnyNode(ctx context.Context, q func(*Node) error) error {
+	for {
+		tried := map[int]bool{}
+		// 领导者候选优先（历史最新），随后退到任意存活节点。
+		for _, node := range append(s.leaderCandidates(), s.aliveNodes()...) {
+			if node == nil || tried[node.cfg.ID] {
+				continue
+			}
+			tried[node.cfg.ID] = true
+			err := q(node)
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, ErrPositionUnknown) || errors.Is(err, ErrNotLeader) ||
+				errors.Is(err, ErrStopped) {
+				continue // 该节点还没投影到目标位置：换节点
+			}
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(s.retryEvery):
+		}
+	}
+}
+
+func (s *LockService) aliveNodes() []*Node {
+	var out []*Node
+	for i := 0; i < s.cluster.Size(); i++ {
+		if s.cluster.Network().IsDown(i) {
+			continue
+		}
+		if n := s.cluster.Node(i); n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// OwnershipHistory 返回资源从首次加锁至今的完整归属变化：
+// 每段租约的持有者、令牌、开始位置、续约延长轨迹与结束原因。
+// 历史为追加式：已关闭的段永不被改写或重排。
+func (s *LockService) OwnershipHistory(ctx context.Context, resource string) ([]OwnershipSpan, error) {
+	var spans []OwnershipSpan
+	err := s.queryAnyNode(ctx, func(n *Node) error {
+		v, err := n.OwnershipHistory(resource)
+		if err != nil {
+			return err
+		}
+		spans = v
+		return nil
+	})
+	return spans, err
+}
+
+// HistoryEvents 返回资源的全部审计事件（每次提交的结论与原因）。
+func (s *LockService) HistoryEvents(ctx context.Context, resource string) ([]HistoryEvent, error) {
+	var events []HistoryEvent
+	err := s.queryAnyNode(ctx, func(n *Node) error {
+		v, err := n.HistoryEvents(resource)
+		if err != nil {
+			return err
+		}
+		events = v
+		return nil
+	})
+	return events, err
+}
+
+// StateAt 重建资源在历史位置 seq（日志下标）的持有者、令牌与到期情况。
+func (s *LockService) StateAt(ctx context.Context, resource string, seq int64) (HistoricalState, error) {
+	var st HistoricalState
+	err := s.queryAnyNode(ctx, func(n *Node) error {
+		v, err := n.StateAt(resource, seq)
+		if err != nil {
+			return err
+		}
+		st = v
+		return nil
+	})
+	return st, err
+}
+
+// ValidateAt 判定"携带 token 的提交放在历史位置 seq 是否通过"，
+// 结论与当时状态机给出的判定一致。
+func (s *LockService) ValidateAt(ctx context.Context, resource string, seq int64, owner string, token int64) (ValidateResult, error) {
+	var res ValidateResult
+	err := s.queryAnyNode(ctx, func(n *Node) error {
+		v, err := n.ValidateAt(resource, seq, owner, token)
+		if err != nil {
+			return err
+		}
+		res = v
+		return nil
+	})
+	return res, err
+}
+
+// ExportHistory 导出全量归属历史。runID 作为运行编号写入导出内容：
+// 同一套操作场景独立跑两遍，除 RunID 外导出内容必须完全一致。
+func (s *LockService) ExportHistory(ctx context.Context, runID string) (HistoryExport, error) {
+	var exp HistoryExport
+	err := s.queryAnyNode(ctx, func(n *Node) error {
+		v, err := n.ExportHistory()
+		if err != nil {
+			return err
+		}
+		exp = v
+		return nil
+	})
+	exp.RunID = runID
+	return exp, err
+}

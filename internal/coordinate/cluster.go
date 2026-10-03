@@ -121,6 +121,8 @@ type clusterSettings struct {
 	rpcTimeout  time.Duration
 	dataDir     string // 非空时使用磁盘持久化（演示真实重启）
 	logger      *log.Logger
+	clock       Clock // 非 nil 时全集群共用（如 ManualClock，用于确定性历史）
+	seed        int64 // 非 0 时选举随机源使用固定种子（确定性测试）
 }
 
 // ClusterOption 配置集群参数。
@@ -149,6 +151,17 @@ func WithDataDir(dir string) ClusterOption {
 // WithLogger 设置统一日志输出。
 func WithLogger(l *log.Logger) ClusterOption {
 	return func(s *clusterSettings) { s.logger = l }
+}
+
+// WithClock 让全集群共用一个时钟（如 ManualClock）。
+// 领导者盖章时间取自该时钟，配合固定脚本可得到跨运行完全一致的历史。
+func WithClock(c Clock) ClusterOption {
+	return func(s *clusterSettings) { s.clock = c }
+}
+
+// WithRandomSeed 固定选举随机源种子，使确定性测试中的选举时序可复现。
+func WithRandomSeed(seed int64) ClusterOption {
+	return func(s *clusterSettings) { s.seed = seed }
 }
 
 // NewCluster 创建 n 节点集群（不启动）。
@@ -189,11 +202,16 @@ func NewCluster(n int, opts ...ClusterOption) (*Cluster, error) {
 }
 
 func (c *Cluster) buildNode(id int, peers []int) (*Node, error) {
+	clock := c.opts.clock
+	if clock == nil {
+		clock = wallClock{}
+	}
 	cfg := NodeConfig{
 		ID:          id,
 		Peers:       peers,
 		Transport:   newSimTransport(id, c.net),
-		Clock:       wallClock{},
+		Clock:       clock,
+		Seed:        c.opts.seed,
 		ElectionMin: c.opts.electionMin,
 		ElectionMax: c.opts.electionMax,
 		Heartbeat:   c.opts.heartbeat,
